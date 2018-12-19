@@ -1186,7 +1186,7 @@ ParameterError getparameter(const char *flag, /* f or -long-flag */
         break;
       case '9':
         /* Allow HTTP/0.9 responses! */
-        config->http09_allowed ^= toggle;
+        config->http09_allowed = toggle;
         break;
       }
       break;
