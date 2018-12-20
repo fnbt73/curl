@@ -1,0 +1,1579 @@
+Index: include/curl/curl.h
+===================================================================
+--- include/curl/curl.h	(revision 49985)
++++ include/curl/curl.h	(revision 60690)
+@@ -400,6 +400,8 @@
+    codes must remain the same!
+  */
+ 
++
++
+ typedef enum {
+   CURLE_OK = 0,
+   CURLE_UNSUPPORTED_PROTOCOL,    /* 1 */
+@@ -589,6 +591,18 @@
+                                                             OpenSSL SSL_CTX */
+                                           void *userptr);
+ 
++/* TPS-start */
++
++/* 
++curl_schannel_validate_server_cert_callback
++  PCCERT_CONTEXT peerCert 
++  peerName (server-name)
++*/
++typedef CURLcode (*curl_schannel_validate_server_cert_callback)(CURL* curl, void* peerCert, const char* peerName);
++
++/* TPS-end */
++
++
+ typedef enum {
+   CURLPROXY_HTTP = 0,   /* added in 7.10, new in 7.19.4 default is to use
+                            CONNECT HTTP/1.1 */
+@@ -1571,6 +1585,20 @@
+   /* Set authentication options directly */
+   CINIT(LOGIN_OPTIONS, OBJECTPOINT, 224),
+ 
++
++  /* TPS-start */
++
++  /* schannel client certificate authentication; user can pass in PSCHANNEL_CRED. optional. */
++  CINIT(SCHANNEL_CRED, OBJECTPOINT, 225),
++
++  /* schannel server certificate validation callback (see curl_schannel_validate_server_cert_callback). optional. */
++  CINIT(SCHANNEL_VALIDATE_SERVER_CERT_CALLBACK, FUNCTIONPOINT, 226),
++
++  /* general user-info */
++  CINIT(USER_DATA, OBJECTPOINT, 227),
++
++  /* TPS-end */
++
+   CURLOPT_LASTENTRY /* the last unused */
+ } CURLoption;
+ 
+@@ -2011,6 +2039,7 @@
+ #define CURLINFO_LONG     0x200000
+ #define CURLINFO_DOUBLE   0x300000
+ #define CURLINFO_SLIST    0x400000
++#define CURLINFO_POINTER  0x500000
+ #define CURLINFO_MASK     0x0fffff
+ #define CURLINFO_TYPEMASK 0xf00000
+ 
+@@ -2061,7 +2090,10 @@
+   CURLINFO_TLS_SESSION      = CURLINFO_SLIST  + 43,
+   /* Fill in new entries below here! */
+ 
+-  CURLINFO_LASTONE          = 43
++  /* TPS  */
++  CURLINFO_USER_DATA = CURLINFO_POINTER + 44,
++
++  CURLINFO_LASTONE          = 44
+ } CURLINFO;
+ 
+ /* CURLINFO_RESPONSE_CODE is the new name for the option previously known as
+@@ -2195,6 +2227,8 @@
+ 
+   const char *libssh_version; /* human readable string */
+ 
++  const char *tps_version; /* TPS */
++
+ } curl_version_info_data;
+ 
+ #define CURL_VERSION_IPV6      (1<<0)  /* IPv6-enabled */
+Index: lib/vtls/curl_schannel.c
+===================================================================
+--- lib/vtls/curl_schannel.c	(revision 49985)
++++ lib/vtls/curl_schannel.c	(revision 60690)
+@@ -77,11 +77,52 @@
+ /* The last #include file should be: */
+ #include "memdebug.h"
+ 
+-/* Uncomment to force verbose output
+- * #define infof(x, y, ...) printf(y, __VA_ARGS__)
+- * #define failf(x, y, ...) printf(y, __VA_ARGS__)
+- */
+ 
++
++
++/* 
++  twisted-pair logger: if connection is set to verbose, forward to Curl_debug
++*/
++void tps_log(
++    struct connectdata *conn,
++    int level, /* tron log level */
++    const char *format,
++    ...)
++{
++    if (conn->data->set.verbose)
++    {
++        char buf[1024];
++        int bufsize = sizeof(buf);
++        va_list args;
++        int len;
++
++        /* signal that we will be sending level by setting first char to 0. 
++           then next char is the tron log-level (note len > 2 in this case). */
++        *(buf) = (char)0;
++        *(buf + 1) = (char)level;
++        len = 2;
++
++        va_start(args, format);
++        len += vsnprintf(buf + len, bufsize - len - 1, format, args);
++        if (len > bufsize - 1)
++            len = bufsize - 1;
++        buf[len] = 0;
++        va_end(args);
++
++        /* we do not distinguisth between CURLINFO_SSL_DATA_IN vs OUT */
++        /* note: buf is not guaranteed to be null-terminated in curl's debug callback */
++        Curl_debug(conn->data, CURLINFO_SSL_DATA_IN, buf, len, conn);
++    }
++}
++
++
++/* Uncomment to force verbose output */
++#undef infof
++#undef failf
++#define infof(conn, y, ...) tps_log(conn, 6, y, __VA_ARGS__)
++#define failf(conn, y, ...) tps_log(conn, 3, y, __VA_ARGS__)
++
++
+ static Curl_recv schannel_recv;
+ static Curl_send schannel_send;
+ 
+@@ -114,6 +155,7 @@
+   SecBuffer outbuf;
+   SecBufferDesc outbuf_desc;
+   SCHANNEL_CRED schannel_cred;
++  SCHANNEL_CRED* pschannel_cred = 0;
+   SECURITY_STATUS sspi_status = SEC_E_OK;
+   struct curl_schannel_cred *old_cred = NULL;
+   struct in_addr addr;
+@@ -123,102 +165,124 @@
+   TCHAR *host_name;
+   CURLcode code;
+ 
+-  infof(data, "schannel: SSL/TLS connection with %s port %hu (step 1/3)\n",
++  infof(conn, "schannel: SSL/TLS connection with %s port %hu (step 1/3)\n",
+         conn->host.name, conn->remote_port);
+ 
+   /* check for an existing re-usable credential handle */
+   if(!Curl_ssl_getsessionid(conn, (void**)&old_cred, NULL)) {
+     connssl->cred = old_cred;
+-    infof(data, "schannel: re-using existing credential handle\n");
++    infof(conn, "schannel: re-using existing credential handle\n");
+   }
+   else {
+-    /* setup Schannel API options */
+-    memset(&schannel_cred, 0, sizeof(schannel_cred));
+-    schannel_cred.dwVersion = SCHANNEL_CRED_VERSION;
++    if (!data->set.ssl.schannel_cred) {
+ 
++      pschannel_cred = &schannel_cred;
++
++      /* setup Schannel API options */
++      memset(&schannel_cred, 0, sizeof(schannel_cred));
++      schannel_cred.dwVersion = SCHANNEL_CRED_VERSION;
++
+     if(data->set.ssl.verifypeer) {
+ #ifdef _WIN32_WCE
+-      /* certificate validation on CE doesn't seem to work right; we'll
+-         do it following a more manual process. */
+-      schannel_cred.dwFlags = SCH_CRED_MANUAL_CRED_VALIDATION |
+-                              SCH_CRED_IGNORE_NO_REVOCATION_CHECK |
+-                              SCH_CRED_IGNORE_REVOCATION_OFFLINE;
++        /* certificate validation on CE doesn't seem to work right; we'll
++           do it following a more manual process. */
++        schannel_cred.dwFlags = SCH_CRED_MANUAL_CRED_VALIDATION |
++          SCH_CRED_IGNORE_NO_REVOCATION_CHECK |
++          SCH_CRED_IGNORE_REVOCATION_OFFLINE;
+ #else
+-      schannel_cred.dwFlags = SCH_CRED_AUTO_CRED_VALIDATION |
+-                              SCH_CRED_REVOCATION_CHECK_CHAIN;
++        schannel_cred.dwFlags = SCH_CRED_AUTO_CRED_VALIDATION |
++          SCH_CRED_REVOCATION_CHECK_CHAIN;
+ #endif
+-      infof(data, "schannel: checking server certificate revocation\n");
+-    }
+-    else {
+-      schannel_cred.dwFlags = SCH_CRED_MANUAL_CRED_VALIDATION |
+-                              SCH_CRED_IGNORE_NO_REVOCATION_CHECK |
+-                              SCH_CRED_IGNORE_REVOCATION_OFFLINE;
+-      infof(data, "schannel: disable server certificate revocation checks\n");
+-    }
++        infof(conn, "schannel: checking server certificate revocation\n");
++      }
++      else {
++        schannel_cred.dwFlags = SCH_CRED_MANUAL_CRED_VALIDATION |
++          SCH_CRED_IGNORE_NO_REVOCATION_CHECK |
++          SCH_CRED_IGNORE_REVOCATION_OFFLINE;
++        infof(conn, "schannel: disable server certificate revocation checks\n");
++      }
+ 
+-    if(Curl_inet_pton(AF_INET, conn->host.name, &addr)
++      if(Curl_inet_pton(AF_INET, conn->host.name, &addr)
+ #ifdef ENABLE_IPV6
+-       || Curl_inet_pton(AF_INET6, conn->host.name, &addr6)
++         || Curl_inet_pton(AF_INET6, conn->host.name, &addr6)
+ #endif
+-      ) {
+-      schannel_cred.dwFlags |= SCH_CRED_NO_SERVERNAME_CHECK;
+-      infof(data, "schannel: using IP address, SNI is being disabled by "
+-                  "disabling the servername check against the "
+-                  "subject names in server certificates.\n");
+-    }
++        ) {
++        schannel_cred.dwFlags |= SCH_CRED_NO_SERVERNAME_CHECK;
++        infof(conn, "schannel: using IP address, SNI is being disabled by "
++                    "disabling the servername check against the "
++                    "subject names in server certificates.\n");
++      }
+ 
+-    if(!data->set.ssl.verifyhost) {
+-      schannel_cred.dwFlags |= SCH_CRED_NO_SERVERNAME_CHECK;
+-      infof(data, "schannel: verifyhost setting prevents Schannel from "
+-                  "comparing the supplied target name with the subject "
+-                  "names in server certificates. Also disables SNI.\n");
+-    }
++      if(!data->set.ssl.verifyhost) {
++        schannel_cred.dwFlags |= SCH_CRED_NO_SERVERNAME_CHECK;
++        infof(conn, "schannel: verifyhost setting prevents Schannel from "
++                    "comparing the supplied target name with the subject "
++                    "names in server certificates. Also disables SNI.\n");
++      }
+ 
+-    switch(data->set.ssl.version) {
+-      case CURL_SSLVERSION_TLSv1:
+-        schannel_cred.grbitEnabledProtocols = SP_PROT_TLS1_0_CLIENT |
+-                                              SP_PROT_TLS1_1_CLIENT |
+-                                              SP_PROT_TLS1_2_CLIENT;
+-        break;
+-      case CURL_SSLVERSION_TLSv1_0:
+-        schannel_cred.grbitEnabledProtocols = SP_PROT_TLS1_0_CLIENT;
+-        break;
+-      case CURL_SSLVERSION_TLSv1_1:
+-        schannel_cred.grbitEnabledProtocols = SP_PROT_TLS1_1_CLIENT;
+-        break;
+-      case CURL_SSLVERSION_TLSv1_2:
+-        schannel_cred.grbitEnabledProtocols = SP_PROT_TLS1_2_CLIENT;
+-        break;
+-      case CURL_SSLVERSION_SSLv3:
+-        schannel_cred.grbitEnabledProtocols = SP_PROT_SSL3_CLIENT;
+-        break;
+-      case CURL_SSLVERSION_SSLv2:
+-        schannel_cred.grbitEnabledProtocols = SP_PROT_SSL2_CLIENT;
+-        break;
++      switch(data->set.ssl.version) {
++        case CURL_SSLVERSION_TLSv1:
++          schannel_cred.grbitEnabledProtocols = SP_PROT_TLS1_0_CLIENT |
++                                                SP_PROT_TLS1_1_CLIENT |
++                                                SP_PROT_TLS1_2_CLIENT;
++          break;
++        case CURL_SSLVERSION_TLSv1_0:
++          schannel_cred.grbitEnabledProtocols = SP_PROT_TLS1_0_CLIENT;
++          break;
++        case CURL_SSLVERSION_TLSv1_1:
++          schannel_cred.grbitEnabledProtocols = SP_PROT_TLS1_1_CLIENT;
++          break;
++        case CURL_SSLVERSION_TLSv1_2:
++          schannel_cred.grbitEnabledProtocols = SP_PROT_TLS1_2_CLIENT;
++          break;
++        case CURL_SSLVERSION_SSLv3:
++          schannel_cred.grbitEnabledProtocols = SP_PROT_SSL3_CLIENT;
++          break;
++        case CURL_SSLVERSION_SSLv2:
++          schannel_cred.grbitEnabledProtocols = SP_PROT_SSL2_CLIENT;
++          break;
++        default:
++          schannel_cred.grbitEnabledProtocols = SP_PROT_TLS1_0_CLIENT |
++                                                SP_PROT_TLS1_1_CLIENT |
++                                                SP_PROT_TLS1_2_CLIENT |
++                                                SP_PROT_SSL3_CLIENT;
++          break;
++
++      }
+     }
++    else {
++      /* user-defined pschannel_cred */
++      pschannel_cred = (SCHANNEL_CRED*)(data->set.ssl.schannel_cred);
++      infof(conn, "schannel: using supplied credential\n");
++    }
+ 
+     /* allocate memory for the re-usable credential handle */
+     connssl->cred = malloc(sizeof(struct curl_schannel_cred));
+     if(!connssl->cred) {
+-      failf(data, "schannel: unable to allocate memory");
++      failf(conn, "schannel: unable to allocate memory");
+       return CURLE_OUT_OF_MEMORY;
+     }
+     memset(connssl->cred, 0, sizeof(struct curl_schannel_cred));
+ 
+     /* http://msdn.microsoft.com/en-us/library/windows/desktop/aa374716.aspx */
+-    sspi_status = s_pSecFn->AcquireCredentialsHandle(NULL, (TCHAR *)UNISP_NAME,
+-      SECPKG_CRED_OUTBOUND, NULL, &schannel_cred, NULL, NULL,
+-      &connssl->cred->cred_handle, &connssl->cred->time_stamp);
++    SECURITY_STATUS sspi_status = s_pSecFn->AcquireCredentialsHandle(NULL,
++        UNISP_NAME,
++        SECPKG_CRED_OUTBOUND, NULL,
++        pschannel_cred,
++        NULL,
++        NULL,
++        &connssl->cred->cred_handle,
++        &connssl->cred->time_stamp);
+ 
+-    if(sspi_status != SEC_E_OK) {
+-      if(sspi_status == SEC_E_WRONG_PRINCIPAL)
+-        failf(data, "schannel: SNI or certificate check failed: %s",
+-              Curl_sspi_strerror(conn, sspi_status));
+-      else
+-        failf(data, "schannel: AcquireCredentialsHandle failed: %s",
+-              Curl_sspi_strerror(conn, sspi_status));
+-      Curl_safefree(connssl->cred);
+-      return CURLE_SSL_CONNECT_ERROR;
++    if (sspi_status != SEC_E_OK) {
++        if (sspi_status == SEC_E_WRONG_PRINCIPAL)
++            failf(conn, "schannel: SNI or certificate check failed: %s",
++            Curl_sspi_strerror(conn, sspi_status));
++        else
++            failf(conn, "schannel: AcquireCredentialsHandle failed: %s",
++            Curl_sspi_strerror(conn, sspi_status));
++        Curl_safefree(connssl->cred);
++        return CURLE_SSL_CONNECT_ERROR;
+     }
+   }
+ 
+@@ -226,15 +290,19 @@
+   InitSecBuffer(&outbuf, SECBUFFER_EMPTY, NULL, 0);
+   InitSecBufferDesc(&outbuf_desc, &outbuf, 1);
+ 
++  /* cdp-todo: optionally pass in these flags (and perhaps connssl->ret_flags mask) */
+   /* setup request flags */
+   connssl->req_flags = ISC_REQ_SEQUENCE_DETECT | ISC_REQ_REPLAY_DETECT |
+                        ISC_REQ_CONFIDENTIALITY | ISC_REQ_ALLOCATE_MEMORY |
+-                       ISC_REQ_STREAM;
++                       ISC_REQ_STREAM 
++                       /* ISC_REQ_EXTENDED_ERROR */
++                       /* ISC_REQ_MUTUAL_AUTH | ISC_REQ_INTEGRITY */
++                       ;
+ 
+   /* allocate memory for the security context handle */
+   connssl->ctxt = malloc(sizeof(struct curl_schannel_ctxt));
+   if(!connssl->ctxt) {
+-    failf(data, "schannel: unable to allocate memory");
++    failf(conn, "schannel: unable to allocate memory");
+     return CURLE_OUT_OF_MEMORY;
+   }
+   memset(connssl->ctxt, 0, sizeof(struct curl_schannel_ctxt));
+@@ -254,16 +322,16 @@
+ 
+   if(sspi_status != SEC_I_CONTINUE_NEEDED) {
+     if(sspi_status == SEC_E_WRONG_PRINCIPAL)
+-      failf(data, "schannel: SNI or certificate check failed: %s",
++      failf(conn, "schannel: SNI or certificate check failed: %s",
+             Curl_sspi_strerror(conn, sspi_status));
+     else
+-      failf(data, "schannel: initial InitializeSecurityContext failed: %s",
++      failf(conn, "schannel: initial InitializeSecurityContext failed: %s",
+             Curl_sspi_strerror(conn, sspi_status));
+     Curl_safefree(connssl->ctxt);
+     return CURLE_SSL_CONNECT_ERROR;
+   }
+ 
+-  infof(data, "schannel: sending initial handshake data: "
++  infof(conn, "schannel: sending initial handshake data: "
+         "sending %lu bytes...\n", outbuf.cbBuffer);
+ 
+   /* send initial handshake data which is now stored in output buffer */
+@@ -271,12 +339,12 @@
+                           outbuf.cbBuffer, &written);
+   s_pSecFn->FreeContextBuffer(outbuf.pvBuffer);
+   if((code != CURLE_OK) || (outbuf.cbBuffer != (size_t)written)) {
+-    failf(data, "schannel: failed to send initial handshake data: "
++    failf(conn, "schannel: failed to send initial handshake data: "
+           "sent %zd of %lu bytes", written, outbuf.cbBuffer);
+     return CURLE_SSL_CONNECT_ERROR;
+   }
+ 
+-  infof(data, "schannel: sent initial handshake data: "
++  infof(conn, "schannel: sent initial handshake data: "
+         "sent %zd bytes\n", written);
+ 
+   /* continue to second handshake step */
+@@ -298,12 +366,12 @@
+   SecBufferDesc inbuf_desc;
+   SECURITY_STATUS sspi_status = SEC_E_OK;
+   TCHAR *host_name;
+-  CURLcode code;
++  CURLcode code = CURLE_OK;
+   bool doread;
+ 
+   doread = (connssl->connecting_state != ssl_connect_2_writing) ? TRUE : FALSE;
+ 
+-  infof(data, "schannel: SSL/TLS connection with %s port %hu (step 2/3)\n",
++  infof(conn, "schannel: SSL/TLS connection with %s port %hu (step 2/3)\n",
+         conn->host.name, conn->remote_port);
+ 
+   /* buffer to store previously received and encrypted data */
+@@ -312,7 +380,7 @@
+     connssl->encdata_length = CURL_SCHANNEL_BUFFER_INIT_SIZE;
+     connssl->encdata_buffer = malloc(connssl->encdata_length);
+     if(connssl->encdata_buffer == NULL) {
+-      failf(data, "schannel: unable to allocate memory");
++      failf(conn, "schannel: unable to allocate memory");
+       return CURLE_OUT_OF_MEMORY;
+     }
+   }
+@@ -326,7 +394,7 @@
+                                       connssl->encdata_length);
+ 
+     if(connssl->encdata_buffer == NULL) {
+-      failf(data, "schannel: unable to re-allocate memory");
++      failf(conn, "schannel: unable to re-allocate memory");
+       return CURLE_OUT_OF_MEMORY;
+     }
+   }
+@@ -341,12 +409,12 @@
+       if(code == CURLE_AGAIN) {
+         if(connssl->connecting_state != ssl_connect_2_writing)
+           connssl->connecting_state = ssl_connect_2_reading;
+-        infof(data, "schannel: failed to receive handshake, "
++        infof(conn, "schannel: failed to receive handshake, "
+               "need more data\n");
+         return CURLE_OK;
+       }
+       else if((code != CURLE_OK) || (nread == 0)) {
+-        failf(data, "schannel: failed to receive handshake, "
++        failf(conn, "schannel: failed to receive handshake, "
+               "SSL/TLS connection failed");
+         return CURLE_SSL_CONNECT_ERROR;
+       }
+@@ -355,12 +423,23 @@
+       connssl->encdata_offset += nread;
+     }
+ 
+-    infof(data, "schannel: encrypted data buffer: offset %zu length %zu\n",
++    infof(conn, "schannel: encrypted data buffer: offset %zu length %zu\n",
+         connssl->encdata_offset, connssl->encdata_length);
+ 
+     /* setup input buffers */
+-    InitSecBuffer(&inbuf[0], SECBUFFER_TOKEN, malloc(connssl->encdata_offset),
+-                  curlx_uztoul(connssl->encdata_offset));
++
++    /* cdp: explicitly check for connssl->encdata_offset == 0; happens if peer initiates renegotiation */
++    if (!connssl->encdata_offset)
++    {
++      InitSecBuffer(&inbuf[0], SECBUFFER_TOKEN, malloc(connssl->encdata_length), 
++        connssl->encdata_length);
++    }
++    else
++    {
++      InitSecBuffer(&inbuf[0], SECBUFFER_TOKEN, malloc(connssl->encdata_offset), 
++        curlx_uztoul(connssl->encdata_offset));
++    }
++
+     InitSecBuffer(&inbuf[1], SECBUFFER_EMPTY, NULL, 0);
+     InitSecBufferDesc(&inbuf_desc, inbuf, 2);
+ 
+@@ -370,13 +449,12 @@
+     InitSecBufferDesc(&outbuf_desc, outbuf, 2);
+ 
+     if(inbuf[0].pvBuffer == NULL) {
+-      failf(data, "schannel: unable to allocate memory");
++      failf(conn, "schannel: unable to allocate memory");
+       return CURLE_OUT_OF_MEMORY;
+     }
+ 
+     /* copy received handshake data into input buffer */
+-    memcpy(inbuf[0].pvBuffer, connssl->encdata_buffer,
+-           connssl->encdata_offset);
++    memcpy(inbuf[0].pvBuffer, connssl->encdata_buffer, connssl->encdata_offset);
+ 
+     host_name = Curl_convert_UTF8_to_tchar(conn->host.name);
+     if(!host_name)
+@@ -397,7 +475,7 @@
+     /* check if the handshake was incomplete */
+     if(sspi_status == SEC_E_INCOMPLETE_MESSAGE) {
+       connssl->connecting_state = ssl_connect_2_reading;
+-      infof(data, "schannel: received incomplete message, need more data\n");
++      infof(conn, "schannel: received incomplete message, need more data\n");
+       return CURLE_OK;
+     }
+ 
+@@ -406,7 +484,7 @@
+       for(i = 0; i < 2; i++) {
+         /* search for handshake tokens that need to be send */
+         if(outbuf[i].BufferType == SECBUFFER_TOKEN && outbuf[i].cbBuffer > 0) {
+-          infof(data, "schannel: sending next handshake data: "
++          infof(conn, "schannel: sending next handshake data: "
+                 "sending %lu bytes...\n", outbuf[i].cbBuffer);
+ 
+           /* send handshake token to server */
+@@ -414,7 +492,7 @@
+                                   outbuf[i].pvBuffer, outbuf[i].cbBuffer,
+                                   &written);
+           if((code != CURLE_OK) || (outbuf[i].cbBuffer != (size_t)written)) {
+-            failf(data, "schannel: failed to send next handshake data: "
++            failf(conn, "schannel: failed to send next handshake data: "
+                   "sent %zd of %lu bytes", written, outbuf[i].cbBuffer);
+             return CURLE_SSL_CONNECT_ERROR;
+           }
+@@ -428,10 +506,10 @@
+     }
+     else {
+       if(sspi_status == SEC_E_WRONG_PRINCIPAL)
+-        failf(data, "schannel: SNI or certificate check failed: %s",
++        failf(conn, "schannel: SNI or certificate check failed: %s",
+               Curl_sspi_strerror(conn, sspi_status));
+       else
+-        failf(data, "schannel: next InitializeSecurityContext failed: %s",
++        failf(conn, "schannel: next InitializeSecurityContext failed: %s",
+               Curl_sspi_strerror(conn, sspi_status));
+       return CURLE_SSL_CONNECT_ERROR;
+     }
+@@ -438,7 +516,7 @@
+ 
+     /* check if there was additional remaining encrypted data */
+     if(inbuf[1].BufferType == SECBUFFER_EXTRA && inbuf[1].cbBuffer > 0) {
+-      infof(data, "schannel: encrypted data length: %lu\n", inbuf[1].cbBuffer);
++      infof(conn, "schannel: encrypted data length: %lu\n", inbuf[1].cbBuffer);
+       /*
+          There are two cases where we could be getting extra data here:
+          1) If we're renegotiating a connection and the handshake is already
+@@ -477,7 +555,7 @@
+   /* check if the handshake is complete */
+   if(sspi_status == SEC_E_OK) {
+     connssl->connecting_state = ssl_connect_3;
+-    infof(data, "schannel: SSL/TLS handshake complete\n");
++    infof(conn, "schannel: SSL/TLS handshake complete\n");
+   }
+ 
+ #ifdef _WIN32_WCE
+@@ -487,7 +565,37 @@
+     return verify_certificate(conn, sockindex);
+ #endif
+ 
+-  return CURLE_OK;
++  /* TPS: check if user supplied server certificate validation callback */
++  if (data->set.ssl.schannel_fn)
++  {
++    CERT_CONTEXT* pCertContextServer = NULL;
++    SECURITY_STATUS secStatus = s_pSecFn->QueryContextAttributes(&connssl->ctxt->ctxt_handle,
++      SECPKG_ATTR_REMOTE_CERT_CONTEXT,
++      &pCertContextServer);
++
++    if (secStatus == SEC_E_OK && pCertContextServer)
++    {
++        code = (*data->set.ssl.schannel_fn)(data, pCertContextServer, conn->host.name);
++        if (code != CURLE_OK)
++        {
++          failf(conn, "schannel: server cert validation failed in callback: %s", Curl_sspi_strerror(conn, code));
++          code = CURLE_PEER_FAILED_VERIFICATION;
++        }
++    }
++    else
++    {
++        failf(conn, "schannel: Failed to read remote certificate context: %s", Curl_sspi_strerror(conn, secStatus));
++        code = CURLE_PEER_FAILED_VERIFICATION;
++    }
++
++    if (pCertContextServer)
++    {
++        CertFreeCertificateContext(pCertContextServer);
++        pCertContextServer = NULL;
++    }
++  }
++
++  return code;
+ }
+ 
+ static CURLcode
+@@ -501,21 +609,23 @@
+ 
+   DEBUGASSERT(ssl_connect_3 == connssl->connecting_state);
+ 
+-  infof(data, "schannel: SSL/TLS connection with %s port %hu (step 3/3)\n",
++  infof(conn, "schannel: SSL/TLS connection with %s port %hu (step 3/3)\n",
+         conn->host.name, conn->remote_port);
+ 
+   /* check if the required context attributes are met */
+   if(connssl->ret_flags != connssl->req_flags) {
++    failf(conn, "schannel: context attribute flags mismatched. requested=%lu, returned=%lu", connssl->req_flags, connssl->ret_flags);
++
+     if(!(connssl->ret_flags & ISC_RET_SEQUENCE_DETECT))
+-      failf(data, "schannel: failed to setup sequence detection");
++      failf(conn, "schannel: failed to setup sequence detection");
+     if(!(connssl->ret_flags & ISC_RET_REPLAY_DETECT))
+-      failf(data, "schannel: failed to setup replay detection");
++      failf(conn, "schannel: failed to setup replay detection");
+     if(!(connssl->ret_flags & ISC_RET_CONFIDENTIALITY))
+-      failf(data, "schannel: failed to setup confidentiality");
++      failf(conn, "schannel: failed to setup confidentiality");
+     if(!(connssl->ret_flags & ISC_RET_ALLOCATED_MEMORY))
+-      failf(data, "schannel: failed to setup memory allocation");
++      failf(conn, "schannel: failed to setup memory allocation");
+     if(!(connssl->ret_flags & ISC_RET_STREAM))
+-      failf(data, "schannel: failed to setup stream orientation");
++      failf(conn, "schannel: failed to setup stream orientation");
+     return CURLE_SSL_CONNECT_ERROR;
+   }
+ 
+@@ -522,7 +632,7 @@
+   /* increment the reference counter of the credential/session handle */
+   if(connssl->cred && connssl->ctxt) {
+     connssl->cred->refcount++;
+-    infof(data, "schannel: incremented credential handle refcount = %d\n",
++    infof(conn, "schannel: incremented credential handle refcount = %d\n",
+           connssl->cred->refcount);
+   }
+ 
+@@ -530,7 +640,7 @@
+   incache = !(Curl_ssl_getsessionid(conn, (void**)&old_cred, NULL));
+   if(incache) {
+     if(old_cred != connssl->cred) {
+-      infof(data, "schannel: old credential handle is stale, removing\n");
++      infof(conn, "schannel: old credential handle is stale, removing\n");
+       Curl_ssl_delsessionid(conn, (void*)old_cred);
+       incache = FALSE;
+     }
+@@ -539,12 +649,12 @@
+     retcode = Curl_ssl_addsessionid(conn, (void*)connssl->cred,
+                                     sizeof(struct curl_schannel_cred));
+     if(retcode) {
+-      failf(data, "schannel: failed to store credential handle");
++      failf(conn, "schannel: failed to store credential handle");
+       return retcode;
+     }
+     else {
+       connssl->cred->cached = TRUE;
+-      infof(data, "schannel: stored credential handle in session cache\n");
++      infof(conn, "schannel: stored credential handle in session cache\n");
+     }
+   }
+ 
+@@ -576,7 +686,7 @@
+ 
+     if(timeout_ms < 0) {
+       /* no need to continue if time already is up */
+-      failf(data, "SSL/TLS connection timeout");
++      failf(conn, "SSL/TLS connection timeout");
+       return CURLE_OPERATION_TIMEDOUT;
+     }
+ 
+@@ -594,7 +704,7 @@
+ 
+     if(timeout_ms < 0) {
+       /* no need to continue if time already is up */
+-      failf(data, "SSL/TLS connection timeout");
++      failf(conn, "SSL/TLS connection timeout");
+       return CURLE_OPERATION_TIMEDOUT;
+     }
+ 
+@@ -610,7 +720,7 @@
+       what = Curl_socket_ready(readfd, writefd, nonblocking ? 0 : timeout_ms);
+       if(what < 0) {
+         /* fatal error */
+-        failf(data, "select/poll on SSL/TLS socket, errno: %d", SOCKERRNO);
++        failf(conn, "select/poll on SSL/TLS socket, errno: %d", SOCKERRNO);
+         return CURLE_SSL_CONNECT_ERROR;
+       }
+       else if(0 == what) {
+@@ -620,7 +730,7 @@
+         }
+         else {
+           /* timeout */
+-          failf(data, "SSL/TLS connection timeout");
++          failf(conn, "SSL/TLS connection timeout");
+           return CURLE_OPERATION_TIMEDOUT;
+         }
+       }
+@@ -684,6 +794,7 @@
+                               SECPKG_ATTR_STREAM_SIZES,
+                               &connssl->stream_sizes);
+     if(sspi_status != SEC_E_OK) {
++      failf(conn, "schannel: QueryContextAttributes failed %s", Curl_sspi_strerror(conn, sspi_status));
+       *err = CURLE_SEND_ERROR;
+       return -1;
+     }
+@@ -691,6 +802,7 @@
+ 
+   /* check if the buffer is longer than the maximum message length */
+   if(len > connssl->stream_sizes.cbMaximumMessage) {
++    failf(conn, "schannel: buffer too long in schannel_send()");
+     *err = CURLE_SEND_ERROR;
+     return -1;
+   }
+@@ -700,6 +812,7 @@
+               connssl->stream_sizes.cbTrailer;
+   data = (unsigned char*) malloc(data_len);
+   if(data == NULL) {
++    failf(conn, "schannel: out of memory in schannel_send()");
+     *err = CURLE_OUT_OF_MEMORY;
+     return -1;
+   }
+@@ -756,7 +869,7 @@
+       timeleft = Curl_timeleft(conn->data, NULL, TRUE);
+       if(timeleft < 0) {
+         /* we already got the timeout */
+-        failf(conn->data, "schannel: timed out sending data "
++        failf(conn, "schannel: timed out sending data "
+               "(bytes sent: %zd)", written);
+         *err = CURLE_OPERATION_TIMEDOUT;
+         written = -1;
+@@ -767,13 +880,13 @@
+                                timeleft);
+       if(what < 0) {
+         /* fatal error */
+-        failf(conn->data, "select/poll on SSL socket, errno: %d", SOCKERRNO);
++        failf(conn, "select/poll on SSL socket, errno: %d", SOCKERRNO);
+         *err = CURLE_SEND_ERROR;
+         written = -1;
+         break;
+       }
+       else if(0 == what) {
+-        failf(conn->data, "schannel: timed out sending data "
++        failf(conn, "schannel: timed out sending data "
+               "(bytes sent: %zd)", written);
+         *err = CURLE_OPERATION_TIMEDOUT;
+         written = -1;
+@@ -801,6 +914,10 @@
+     *err = CURLE_SEND_ERROR;
+   }
+ 
++  if (sspi_status != SEC_E_OK) {
++   failf(conn, "schannel: EncryptMessage failed %s", Curl_sspi_strerror(conn, sspi_status));
++  }
++
+   Curl_safefree(data);
+ 
+   if(len == (size_t)written)
+@@ -825,7 +942,7 @@
+   SecBufferDesc inbuf_desc;
+   SECURITY_STATUS sspi_status = SEC_E_OK;
+ 
+-  infof(data, "schannel: client wants to read %zu bytes\n", len);
++  infof(conn, "schannel: client wants to read %zu bytes\n", len);
+   *err = CURLE_OK;
+ 
+   /* buffer to store previously received and decrypted data */
+@@ -834,7 +951,7 @@
+     connssl->decdata_length = CURL_SCHANNEL_BUFFER_INIT_SIZE;
+     connssl->decdata_buffer = malloc(connssl->decdata_length);
+     if(connssl->decdata_buffer == NULL) {
+-      failf(data, "schannel: unable to allocate memory");
++      failf(conn, "schannel: unable to allocate memory");
+       *err = CURLE_OUT_OF_MEMORY;
+       return -1;
+     }
+@@ -849,7 +966,7 @@
+                                       connssl->encdata_length);
+ 
+     if(connssl->encdata_buffer == NULL) {
+-      failf(data, "schannel: unable to re-allocate memory");
++      failf(conn, "schannel: unable to re-allocate memory");
+       *err = CURLE_OUT_OF_MEMORY;
+       return -1;
+     }
+@@ -856,7 +973,7 @@
+   }
+ 
+   /* read encrypted data from socket */
+-  infof(data, "schannel: encrypted data buffer: offset %zu length %zu\n",
++  infof(conn, "schannel: encrypted data buffer: offset %zu length %zu\n",
+         connssl->encdata_offset, connssl->encdata_length);
+   size = connssl->encdata_length - connssl->encdata_offset;
+   if(size > 0) {
+@@ -864,8 +981,11 @@
+                   (char *) (connssl->encdata_buffer + connssl->encdata_offset),
+                            size, &nread);
+     /* check for received data */
+-    if(*err != CURLE_OK)
+-      ret = -1;
++    if (*err != CURLE_OK)
++    {
++        infof(conn, "schannel: Curl_read_plain returned error %d\n", (int)(*err));
++        ret = -1;
++    }
+     else {
+       if(nread > 0)
+         /* increase encrypted data buffer offset */
+@@ -872,10 +992,10 @@
+         connssl->encdata_offset += nread;
+       ret = nread;
+     }
+-    infof(data, "schannel: encrypted data got %zd\n", ret);
++    infof(conn, "schannel: encrypted data got %zd\n", ret);
+   }
+ 
+-  infof(data, "schannel: encrypted data buffer: offset %zu length %zu\n",
++  infof(conn, "schannel: encrypted data buffer: offset %zu length %zu\n",
+         connssl->encdata_offset, connssl->encdata_length);
+ 
+   /* check if we still have some data in our buffers */
+@@ -898,7 +1018,7 @@
+ 
+     /* check if we need more data */
+     if(sspi_status == SEC_E_INCOMPLETE_MESSAGE) {
+-      infof(data, "schannel: failed to decrypt data, need more data\n");
++      infof(conn, "schannel: failed to decrypt data, need more data\n");
+       *err = CURLE_AGAIN;
+       return -1;
+     }
+@@ -909,7 +1029,7 @@
+                                   sspi_status == SEC_I_CONTEXT_EXPIRED) {
+       /* check for successfully decrypted data */
+       if(inbuf[1].BufferType == SECBUFFER_DATA) {
+-        infof(data, "schannel: decrypted data length: %lu\n",
++        infof(conn, "schannel: decrypted data length: %lu\n",
+               inbuf[1].cbBuffer);
+ 
+         /* increase buffer in order to fit the received amount of data */
+@@ -923,7 +1043,7 @@
+                                             connssl->decdata_length);
+ 
+           if(connssl->decdata_buffer == NULL) {
+-            failf(data, "schannel: unable to re-allocate memory");
++            failf(conn, "schannel: unable to re-allocate memory");
+             *err = CURLE_OUT_OF_MEMORY;
+             return -1;
+           }
+@@ -937,14 +1057,14 @@
+           connssl->decdata_offset += size;
+         }
+ 
+-        infof(data, "schannel: decrypted data added: %zu\n", size);
+-        infof(data, "schannel: decrypted data cached: offset %zu length %zu\n",
++        infof(conn, "schannel: decrypted data added: %zu\n", size);
++        infof(conn, "schannel: decrypted data cached: offset %zu length %zu\n",
+               connssl->decdata_offset, connssl->decdata_length);
+       }
+ 
+       /* check for remaining encrypted data */
+       if(inbuf[3].BufferType == SECBUFFER_EXTRA && inbuf[3].cbBuffer > 0) {
+-        infof(data, "schannel: encrypted data length: %lu\n",
++        infof(conn, "schannel: encrypted data length: %lu\n",
+               inbuf[3].cbBuffer);
+ 
+         /* check if the remaining data is less than the total amount
+@@ -959,7 +1079,7 @@
+           connssl->encdata_offset = inbuf[3].cbBuffer;
+         }
+ 
+-        infof(data, "schannel: encrypted data cached: offset %zu length %zu\n",
++        infof(conn, "schannel: encrypted data cached: offset %zu length %zu\n",
+               connssl->encdata_offset, connssl->encdata_length);
+       }
+       else{
+@@ -970,10 +1090,10 @@
+ 
+     /* check if server wants to renegotiate the connection context */
+     if(sspi_status == SEC_I_RENEGOTIATE) {
+-      infof(data, "schannel: remote party requests SSL/TLS renegotiation\n");
++      infof(conn, "schannel: remote party requests SSL/TLS renegotiation\n");
+ 
+       /* begin renegotiation */
+-      infof(data, "schannel: renegotiating SSL/TLS connection\n");
++      infof(conn, "schannel: renegotiating SSL/TLS connection\n");
+       connssl->state = ssl_connection_negotiating;
+       connssl->connecting_state = ssl_connect_2_writing;
+       retcode = schannel_connect_common(conn, sockindex, FALSE, &done);
+@@ -980,7 +1100,7 @@
+       if(retcode)
+         *err = retcode;
+       else {
+-        infof(data, "schannel: SSL/TLS connection renegotiated\n");
++        infof(conn, "schannel: SSL/TLS connection renegotiated\n");
+         /* now retry receiving data */
+         return schannel_recv(conn, sockindex, buf, len, err);
+       }
+@@ -987,7 +1107,7 @@
+     }
+   }
+ 
+-  infof(data, "schannel: decrypted data buffer: offset %zu length %zu\n",
++  infof(conn, "schannel: decrypted data buffer: offset %zu length %zu\n",
+         connssl->decdata_offset, connssl->decdata_length);
+ 
+   /* copy requested decrypted data to supplied buffer */
+@@ -1001,8 +1121,8 @@
+             connssl->decdata_offset - size);
+     connssl->decdata_offset -= size;
+ 
+-    infof(data, "schannel: decrypted data returned %zd\n", size);
+-    infof(data, "schannel: decrypted data buffer: offset %zu length %zu\n",
++    infof(conn, "schannel: decrypted data returned %zd\n", size);
++    infof(conn, "schannel: decrypted data buffer: offset %zu length %zu\n",
+           connssl->decdata_offset, connssl->decdata_length);
+   }
+ 
+@@ -1010,7 +1130,7 @@
+   if(ret <= 0 && ( /* special check for Windows 2000 Professional */
+       sspi_status == SEC_I_CONTEXT_EXPIRED || (sspi_status == SEC_E_OK &&
+         connssl->encdata_offset > 0 && connssl->encdata_buffer[0] == 0x15))) {
+-    infof(data, "schannel: server closed the connection\n");
++    infof(conn, "schannel: server closed the connection\n");
+     *err = CURLE_OK;
+     return 0;
+   }
+@@ -1017,7 +1137,7 @@
+ 
+   /* check if something went wrong and we need to return an error */
+   if(ret < 0 && sspi_status != SEC_E_OK) {
+-    infof(data, "schannel: failed to read data from server: %s\n",
++    infof(conn, "schannel: failed to read data from server: %s\n",
+           Curl_sspi_strerror(conn, sspi_status));
+     *err = CURLE_RECV_ERROR;
+     return -1;
+@@ -1074,7 +1194,7 @@
+   struct SessionHandle *data = conn->data;
+   struct ssl_connect_data *connssl = &conn->ssl[sockindex];
+ 
+-  infof(data, "schannel: shutting down SSL/TLS connection with %s port %hu\n",
++  infof(conn, "schannel: shutting down SSL/TLS connection with %s port %hu\n",
+         conn->host.name, conn->remote_port);
+ 
+   if(connssl->cred && connssl->ctxt) {
+@@ -1094,7 +1214,7 @@
+                                               &BuffDesc);
+ 
+     if(sspi_status != SEC_E_OK)
+-      failf(data, "schannel: ApplyControlToken failure: %s",
++      failf(conn, "schannel: ApplyControlToken failure: %s",
+             Curl_sspi_strerror(conn, sspi_status));
+ 
+     host_name = Curl_convert_UTF8_to_tchar(conn->host.name);
+@@ -1129,7 +1249,7 @@
+ 
+       s_pSecFn->FreeContextBuffer(outbuf.pvBuffer);
+       if((code != CURLE_OK) || (outbuf.cbBuffer != (size_t)written)) {
+-        infof(data, "schannel: failed to send close msg: %s"
++        infof(conn, "schannel: failed to send close msg: %s"
+               " (bytes written: %zd)\n", curl_easy_strerror(code), written);
+       }
+     }
+@@ -1136,7 +1256,7 @@
+ 
+     /* free SSPI Schannel API security context handle */
+     if(connssl->ctxt) {
+-      infof(data, "schannel: clear security context handle\n");
++      infof(conn, "schannel: clear security context handle\n");
+       s_pSecFn->DeleteSecurityContext(&connssl->ctxt->ctxt_handle);
+       Curl_safefree(connssl->ctxt);
+     }
+@@ -1146,13 +1266,13 @@
+       /* decrement the reference counter of the credential/session handle */
+       if(connssl->cred->refcount > 0) {
+         connssl->cred->refcount--;
+-        infof(data, "schannel: decremented credential handle refcount = %d\n",
++        infof(conn, "schannel: decremented credential handle refcount = %d\n",
+               connssl->cred->refcount);
+       }
+ 
+       /* if the handle was not cached and the refcount is zero */
+       if(!connssl->cred->cached && connssl->cred->refcount == 0) {
+-        infof(data, "schannel: clear credential handle\n");
++        infof(conn, "schannel: clear credential handle\n");
+         s_pSecFn->FreeCredentialsHandle(&connssl->cred->cred_handle);
+         Curl_safefree(connssl->cred);
+       }
+@@ -1218,7 +1338,7 @@
+                                             &pCertContextServer);
+ 
+   if((status != SEC_E_OK) || (pCertContextServer == NULL)) {
+-    failf(data, "schannel: Failed to read remote certificate context: %s",
++    failf(conn, "schannel: Failed to read remote certificate context: %s",
+           Curl_sspi_strerror(conn, status));
+     result = CURLE_PEER_FAILED_VERIFICATION;
+   }
+@@ -1236,7 +1356,7 @@
+                                 0,
+                                 NULL,
+                                 &pChainContext)) {
+-      failf(data, "schannel: CertGetCertificateChain failed: %s",
++      failf(conn, "schannel: CertGetCertificateChain failed: %s",
+             Curl_sspi_strerror(conn, GetLastError()));
+       pChainContext = NULL;
+       result = CURLE_PEER_FAILED_VERIFICATION;
+@@ -1249,15 +1369,15 @@
+       dwTrustErrorMask &= pSimpleChain->TrustStatus.dwErrorStatus;
+       if(dwTrustErrorMask) {
+         if(dwTrustErrorMask & CERT_TRUST_IS_PARTIAL_CHAIN)
+-          failf(data, "schannel: CertGetCertificateChain trust error"
++          failf(conn, "schannel: CertGetCertificateChain trust error"
+                       " CERT_TRUST_IS_PARTIAL_CHAIN");
+         if(dwTrustErrorMask & CERT_TRUST_IS_UNTRUSTED_ROOT)
+-          failf(data, "schannel: CertGetCertificateChain trust error"
++          failf(conn, "schannel: CertGetCertificateChain trust error"
+                       " CERT_TRUST_IS_UNTRUSTED_ROOT");
+         if(dwTrustErrorMask & CERT_TRUST_IS_NOT_TIME_VALID)
+-          failf(data, "schannel: CertGetCertificateChain trust error"
++          failf(conn, "schannel: CertGetCertificateChain trust error"
+                       " CERT_TRUST_IS_NOT_TIME_VALID");
+-        failf(data, "schannel: CertGetCertificateChain error mask: 0x%08x",
++        failf(conn, "schannel: CertGetCertificateChain error mask: 0x%08x",
+               dwTrustErrorMask);
+         result = CURLE_PEER_FAILED_VERIFICATION;
+       }
+@@ -1295,7 +1415,7 @@
+       if(result == CURLE_PEER_FAILED_VERIFICATION) {
+         char *_cert_hostname;
+         _cert_hostname = Curl_convert_tchar_to_UTF8(cert_hostname.tchar_ptr);
+-        failf(data, "schannel: CertGetNameString() certificate hostname "
++        failf(conn, "schannel: CertGetNameString() certificate hostname "
+               "(%s) did not match connection (%s)",
+               _cert_hostname, conn->host.name);
+         Curl_unicodefree(_cert_hostname);
+@@ -1314,4 +1434,12 @@
+ }
+ #endif /* _WIN32_WCE */
+ 
++
++
++#undef infof
++#undef failf
++#define infof(x, y, ...) 
++#define failf(x, y, ...) 
++
++
+ #endif /* USE_SCHANNEL */
+Index: lib/config-win32.h
+===================================================================
+--- lib/config-win32.h	(revision 49985)
++++ lib/config-win32.h	(revision 60690)
+@@ -30,6 +30,8 @@
+ /*                          HEADER FILES                            */
+ /* ---------------------------------------------------------------- */
+ 
++#define ENABLE_IPV6 1
++
+ /* Define if you have the <arpa/inet.h> header file. */
+ /* #define HAVE_ARPA_INET_H 1 */
+ 
+Index: lib/getinfo.c
+===================================================================
+--- lib/getinfo.c	(revision 49985)
++++ lib/getinfo.c	(revision 60690)
+@@ -197,7 +197,6 @@
+   case CURLINFO_RTSP_CSEQ_RECV:
+     *param_longp = data->state.rtsp_CSeq_recv;
+     break;
+-
+   default:
+     return CURLE_BAD_FUNCTION_ARGUMENT;
+   }
+@@ -204,6 +203,20 @@
+   return CURLE_OK;
+ }
+ 
++static CURLcode getinfo_pointer(struct SessionHandle *data, CURLINFO info, void** param)
++{
++    switch (info) {
++
++    case CURLINFO_USER_DATA:
++        *param = data->set.ssl.user_data;
++        break;
++
++    default:
++        return CURLE_BAD_FUNCTION_ARGUMENT;
++    }
++    return CURLE_OK;
++}
++
+ static CURLcode getinfo_double(struct SessionHandle *data, CURLINFO info,
+                                double *param_doublep)
+ {
+@@ -341,6 +354,8 @@
+   double *param_doublep=NULL;
+   char **param_charp=NULL;
+   struct curl_slist **param_slistp=NULL;
++  void** param_pointerp = NULL;
++
+   int type;
+   /* default return code is to error out! */
+   CURLcode ret = CURLE_BAD_FUNCTION_ARGUMENT;
+@@ -372,6 +387,12 @@
+     if(NULL != param_slistp)
+       ret = getinfo_slist(data, info, param_slistp);
+     break;
++  case CURLINFO_POINTER:
++    param_pointerp = va_arg(arg, void**);
++    if (param_pointerp)
++      ret = getinfo_pointer(data, info, param_pointerp);
++    break;
++
+   default:
+     break;
+   }
+Index: lib/url.c
+===================================================================
+--- lib/url.c	(revision 49985)
++++ lib/url.c	(revision 60690)
+@@ -2479,6 +2479,20 @@
+     data->set.tcp_keepintvl = va_arg(param, long);
+     break;
+ 
++
++    /* TPS-start */
++
++  case CURLOPT_SCHANNEL_CRED:
++      data->set.ssl.schannel_cred = va_arg(param, void*);
++      break;
++  case CURLOPT_SCHANNEL_VALIDATE_SERVER_CERT_CALLBACK:
++      data->set.ssl.schannel_fn = va_arg(param, curl_schannel_validate_server_cert_callback);
++      break;
++  case CURLOPT_USER_DATA:
++      data->set.ssl.user_data = va_arg(param, void*);
++      break;
++    /* TPS-end */
++
+   default:
+     /* unknown tag and its companion, just ignore: */
+     result = CURLE_UNKNOWN_OPTION;
+Index: lib/urldata.h
+===================================================================
+--- lib/urldata.h	(revision 49985)
++++ lib/urldata.h	(revision 60690)
+@@ -380,6 +380,12 @@
+   char *password; /* TLS password (for, e.g., SRP) */
+   enum CURL_TLSAUTH authtype; /* TLS authentication type (default SRP) */
+ #endif
++
++  /* TPS-start */
++  void* schannel_cred;
++  curl_schannel_validate_server_cert_callback schannel_fn;
++  void* user_data;
++  /* TPS-end */
+ };
+ 
+ /* information stored about one single SSL session */
+Index: lib/version.c
+===================================================================
+--- lib/version.c	(revision 49985)
++++ lib/version.c	(revision 60690)
+@@ -20,6 +20,9 @@
+  *
+  ***************************************************************************/
+ 
++/* TPS */
++#define TPS_LIBCURL_VERSION "1.0"
++
+ #include "curl_setup.h"
+ 
+ #include <curl/curl.h>
+@@ -84,6 +87,12 @@
+     }
+   }
+ 
++  /* TPS-start */
++  len = snprintf(ptr, left, " tps/%s", TPS_LIBCURL_VERSION);
++  left -= len;
++  ptr += len;
++  /* TPS-end */
++
+ #ifdef HAVE_LIBZ
+   len = snprintf(ptr, left, " zlib/%s", zlibVersion());
+   left -= len;
+@@ -294,6 +303,7 @@
+   NULL, /* libidn version */
+   0,    /* iconv version */
+   NULL, /* ssh lib version */
++  TPS_LIBCURL_VERSION /* TPS */
+ };
+ 
+ curl_version_info_data *curl_version_info(CURLversion stamp)
+Index: vs/vc12/curl.vcxproj
+===================================================================
+--- vs/vc12/curl.vcxproj	(revision 49985)
++++ vs/vc12/curl.vcxproj	(revision 60690)
+@@ -5,10 +5,18 @@
+       <Configuration>debug-winssl</Configuration>
+       <Platform>Win32</Platform>
+     </ProjectConfiguration>
++    <ProjectConfiguration Include="debug-winssl|x64">
++      <Configuration>debug-winssl</Configuration>
++      <Platform>x64</Platform>
++    </ProjectConfiguration>
+     <ProjectConfiguration Include="release-winssl|Win32">
+       <Configuration>release-winssl</Configuration>
+       <Platform>Win32</Platform>
+     </ProjectConfiguration>
++    <ProjectConfiguration Include="release-winssl|x64">
++      <Configuration>release-winssl</Configuration>
++      <Platform>x64</Platform>
++    </ProjectConfiguration>
+   </ItemGroup>
+   <PropertyGroup Label="Globals">
+     <ProjectGuid>{B002F6C9-8462-4E53-ADDD-8DE09C0EB012}</ProjectGuid>
+@@ -22,6 +30,12 @@
+     <PlatformToolset>v120</PlatformToolset>
+     <CharacterSet>NotSet</CharacterSet>
+   </PropertyGroup>
++  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='debug-winssl|x64'" Label="Configuration">
++    <ConfigurationType>Application</ConfigurationType>
++    <UseDebugLibraries>true</UseDebugLibraries>
++    <PlatformToolset>v120</PlatformToolset>
++    <CharacterSet>NotSet</CharacterSet>
++  </PropertyGroup>
+   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='release-winssl|Win32'" Label="Configuration">
+     <ConfigurationType>Application</ConfigurationType>
+     <UseDebugLibraries>false</UseDebugLibraries>
+@@ -29,6 +43,13 @@
+     <WholeProgramOptimization>true</WholeProgramOptimization>
+     <CharacterSet>NotSet</CharacterSet>
+   </PropertyGroup>
++  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='release-winssl|x64'" Label="Configuration">
++    <ConfigurationType>Application</ConfigurationType>
++    <UseDebugLibraries>false</UseDebugLibraries>
++    <PlatformToolset>v120</PlatformToolset>
++    <WholeProgramOptimization>true</WholeProgramOptimization>
++    <CharacterSet>NotSet</CharacterSet>
++  </PropertyGroup>
+   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+   <ImportGroup Label="ExtensionSettings">
+   </ImportGroup>
+@@ -35,9 +56,15 @@
+   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='debug-winssl|Win32'">
+     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+   </ImportGroup>
++  <ImportGroup Condition="'$(Configuration)|$(Platform)'=='debug-winssl|x64'" Label="PropertySheets">
++    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
++  </ImportGroup>
+   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='release-winssl|Win32'">
+     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+   </ImportGroup>
++  <ImportGroup Condition="'$(Configuration)|$(Platform)'=='release-winssl|x64'" Label="PropertySheets">
++    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
++  </ImportGroup>
+   <PropertyGroup Label="UserMacros" />
+   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='debug-winssl|Win32'">
+     <LinkIncremental>true</LinkIncremental>
+@@ -45,11 +72,20 @@
+     <OutDir>..\..\build\bin\$(Platform)\$(Configuration)\</OutDir>
+     <IntDir>$(ProjectName)\$(Configuration)\</IntDir>
+   </PropertyGroup>
++  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='debug-winssl|x64'">
++    <LinkIncremental>true</LinkIncremental>
++    <TargetName>$(ProjectName)d</TargetName>
++    <OutDir>..\..\build\bin\$(Platform)\$(Configuration)\</OutDir>
++  </PropertyGroup>
+   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='release-winssl|Win32'">
+     <LinkIncremental>false</LinkIncremental>
+     <IntDir>$(ProjectName)\$(Configuration)\</IntDir>
+     <OutDir>..\..\build\bin\$(Platform)\$(Configuration)\</OutDir>
+   </PropertyGroup>
++  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='release-winssl|x64'">
++    <OutDir>..\..\build\bin\$(Platform)\$(Configuration)\</OutDir>
++    <LinkIncremental>false</LinkIncremental>
++  </PropertyGroup>
+   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='debug-winssl|Win32'">
+     <ClCompile>
+       <PrecompiledHeader>
+@@ -64,7 +100,7 @@
+     <Link>
+       <SubSystem>Console</SubSystem>
+       <GenerateDebugInformation>true</GenerateDebugInformation>
+-      <AdditionalDependencies>libcurld.lib;ws2_32.lib;wldap32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
++      <AdditionalDependencies>libcurld.lib;crypt32.lib;ws2_32.lib;wldap32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+       <AdditionalLibraryDirectories>..\..\build\lib\$(Platform)\$(Configuration)\</AdditionalLibraryDirectories>
+     </Link>
+     <ResourceCompile>
+@@ -71,6 +107,27 @@
+       <AdditionalIncludeDirectories>..\..\include</AdditionalIncludeDirectories>
+     </ResourceCompile>
+   </ItemDefinitionGroup>
++  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='debug-winssl|x64'">
++    <ClCompile>
++      <PrecompiledHeader>
++      </PrecompiledHeader>
++      <WarningLevel>Level3</WarningLevel>
++      <Optimization>Disabled</Optimization>
++      <PreprocessorDefinitions>_DEBUG;WIN32;_BIND_TO_CURRENT_VCLIBS_VERSION=1;USE_WINDOWS_SSPI;CURL_STATICLIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
++      <MultiProcessorCompilation>false</MultiProcessorCompilation>
++      <AdditionalIncludeDirectories>..\..\Include;..\..\src;..\..\lib</AdditionalIncludeDirectories>
++      <ProgramDataBaseFileName>$(OutDir)$(TargetName).pdb</ProgramDataBaseFileName>
++    </ClCompile>
++    <Link>
++      <SubSystem>Console</SubSystem>
++      <GenerateDebugInformation>true</GenerateDebugInformation>
++      <AdditionalDependencies>libcurld.lib;crypt32.lib;ws2_32.lib;wldap32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
++      <AdditionalLibraryDirectories>..\..\build\lib\$(Platform)\$(Configuration)\</AdditionalLibraryDirectories>
++    </Link>
++    <ResourceCompile>
++      <AdditionalIncludeDirectories>..\..\include</AdditionalIncludeDirectories>
++    </ResourceCompile>
++  </ItemDefinitionGroup>
+   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='release-winssl|Win32'">
+     <ClCompile>
+       <WarningLevel>Level3</WarningLevel>
+@@ -89,7 +146,7 @@
+       <GenerateDebugInformation>true</GenerateDebugInformation>
+       <EnableCOMDATFolding>true</EnableCOMDATFolding>
+       <OptimizeReferences>true</OptimizeReferences>
+-      <AdditionalDependencies>libcurl.lib;ws2_32.lib;wldap32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
++      <AdditionalDependencies>libcurl.lib;crypt32.lib;ws2_32.lib;wldap32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+       <AdditionalLibraryDirectories>..\..\build\lib\$(Platform)\$(Configuration)\</AdditionalLibraryDirectories>
+     </Link>
+     <ResourceCompile>
+@@ -96,6 +153,31 @@
+       <AdditionalIncludeDirectories>..\..\include</AdditionalIncludeDirectories>
+     </ResourceCompile>
+   </ItemDefinitionGroup>
++  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='release-winssl|x64'">
++    <ClCompile>
++      <WarningLevel>Level3</WarningLevel>
++      <PrecompiledHeader>
++      </PrecompiledHeader>
++      <Optimization>MaxSpeed</Optimization>
++      <FunctionLevelLinking>true</FunctionLevelLinking>
++      <IntrinsicFunctions>true</IntrinsicFunctions>
++      <PreprocessorDefinitions>NDEBUG;WIN32;_BIND_TO_CURRENT_VCLIBS_VERSION=1;USE_WINDOWS_SSPI;CURL_STATICLIB</PreprocessorDefinitions>
++      <MultiProcessorCompilation>true</MultiProcessorCompilation>
++      <AdditionalIncludeDirectories>..\..\Include;..\..\src;..\..\lib</AdditionalIncludeDirectories>
++      <ProgramDataBaseFileName>$(OutDir)$(TargetName).pdb</ProgramDataBaseFileName>
++    </ClCompile>
++    <Link>
++      <SubSystem>Console</SubSystem>
++      <GenerateDebugInformation>true</GenerateDebugInformation>
++      <EnableCOMDATFolding>true</EnableCOMDATFolding>
++      <OptimizeReferences>true</OptimizeReferences>
++      <AdditionalDependencies>libcurl.lib;crypt32.lib;ws2_32.lib;wldap32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
++      <AdditionalLibraryDirectories>..\..\build\lib\$(Platform)\$(Configuration)\</AdditionalLibraryDirectories>
++    </Link>
++    <ResourceCompile>
++      <AdditionalIncludeDirectories>..\..\include</AdditionalIncludeDirectories>
++    </ResourceCompile>
++  </ItemDefinitionGroup>
+   <ItemGroup>
+     <ClCompile Include="..\..\lib\nonblock.c" />
+     <ClCompile Include="..\..\lib\rawstr.c" />
+Index: vs/vc12/curl_vc12.sln
+===================================================================
+--- vs/vc12/curl_vc12.sln	(revision 49985)
++++ vs/vc12/curl_vc12.sln	(revision 60690)
+@@ -1,7 +1,7 @@
+ ﻿
+ Microsoft Visual Studio Solution File, Format Version 12.00
+ # Visual Studio 2013
+-VisualStudioVersion = 12.0.21005.1
++VisualStudioVersion = 12.0.30110.0
+ MinimumVisualStudioVersion = 10.0.40219.1
+ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "curl", "curl.vcxproj", "{B002F6C9-8462-4E53-ADDD-8DE09C0EB012}"
+ 	ProjectSection(ProjectDependencies) = postProject
+@@ -13,17 +13,26 @@
+ Global
+ 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+ 		debug-winssl|Win32 = debug-winssl|Win32
++		debug-winssl|x64 = debug-winssl|x64
+ 		release-winssl|Win32 = release-winssl|Win32
++		release-winssl|x64 = release-winssl|x64
+ 	EndGlobalSection
+ 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+ 		{B002F6C9-8462-4E53-ADDD-8DE09C0EB012}.debug-winssl|Win32.ActiveCfg = debug-winssl|Win32
+ 		{B002F6C9-8462-4E53-ADDD-8DE09C0EB012}.debug-winssl|Win32.Build.0 = debug-winssl|Win32
++		{B002F6C9-8462-4E53-ADDD-8DE09C0EB012}.debug-winssl|x64.ActiveCfg = debug-winssl|x64
++		{B002F6C9-8462-4E53-ADDD-8DE09C0EB012}.debug-winssl|x64.Build.0 = debug-winssl|x64
+ 		{B002F6C9-8462-4E53-ADDD-8DE09C0EB012}.release-winssl|Win32.ActiveCfg = release-winssl|Win32
+-		{B002F6C9-8462-4E53-ADDD-8DE09C0EB012}.release-winssl|Win32.Build.0 = release-winssl|Win32
++		{B002F6C9-8462-4E53-ADDD-8DE09C0EB012}.release-winssl|x64.ActiveCfg = release-winssl|x64
++		{B002F6C9-8462-4E53-ADDD-8DE09C0EB012}.release-winssl|x64.Build.0 = release-winssl|x64
+ 		{A8C6DC7F-12A3-4923-B04A-36254D969B53}.debug-winssl|Win32.ActiveCfg = debug-winssl|Win32
+ 		{A8C6DC7F-12A3-4923-B04A-36254D969B53}.debug-winssl|Win32.Build.0 = debug-winssl|Win32
++		{A8C6DC7F-12A3-4923-B04A-36254D969B53}.debug-winssl|x64.ActiveCfg = debug-winssl|x64
++		{A8C6DC7F-12A3-4923-B04A-36254D969B53}.debug-winssl|x64.Build.0 = debug-winssl|x64
+ 		{A8C6DC7F-12A3-4923-B04A-36254D969B53}.release-winssl|Win32.ActiveCfg = release-winssl|Win32
+ 		{A8C6DC7F-12A3-4923-B04A-36254D969B53}.release-winssl|Win32.Build.0 = release-winssl|Win32
++		{A8C6DC7F-12A3-4923-B04A-36254D969B53}.release-winssl|x64.ActiveCfg = release-winssl|x64
++		{A8C6DC7F-12A3-4923-B04A-36254D969B53}.release-winssl|x64.Build.0 = release-winssl|x64
+ 	EndGlobalSection
+ 	GlobalSection(SolutionProperties) = preSolution
+ 		HideSolutionNode = FALSE
+Index: vs/vc12/libcurl.vcxproj
+===================================================================
+--- vs/vc12/libcurl.vcxproj	(revision 49985)
++++ vs/vc12/libcurl.vcxproj	(revision 60690)
+@@ -5,10 +5,18 @@
+       <Configuration>debug-winssl</Configuration>
+       <Platform>Win32</Platform>
+     </ProjectConfiguration>
++    <ProjectConfiguration Include="debug-winssl|x64">
++      <Configuration>debug-winssl</Configuration>
++      <Platform>x64</Platform>
++    </ProjectConfiguration>
+     <ProjectConfiguration Include="release-winssl|Win32">
+       <Configuration>release-winssl</Configuration>
+       <Platform>Win32</Platform>
+     </ProjectConfiguration>
++    <ProjectConfiguration Include="release-winssl|x64">
++      <Configuration>release-winssl</Configuration>
++      <Platform>x64</Platform>
++    </ProjectConfiguration>
+   </ItemGroup>
+   <PropertyGroup Label="Globals">
+     <ProjectGuid>{A8C6DC7F-12A3-4923-B04A-36254D969B53}</ProjectGuid>
+@@ -21,6 +29,12 @@
+     <PlatformToolset>v120</PlatformToolset>
+     <CharacterSet>NotSet</CharacterSet>
+   </PropertyGroup>
++  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='debug-winssl|x64'" Label="Configuration">
++    <ConfigurationType>StaticLibrary</ConfigurationType>
++    <UseDebugLibraries>true</UseDebugLibraries>
++    <PlatformToolset>v120</PlatformToolset>
++    <CharacterSet>NotSet</CharacterSet>
++  </PropertyGroup>
+   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='release-winssl|Win32'" Label="Configuration">
+     <ConfigurationType>StaticLibrary</ConfigurationType>
+     <UseDebugLibraries>false</UseDebugLibraries>
+@@ -28,6 +42,13 @@
+     <WholeProgramOptimization>true</WholeProgramOptimization>
+     <CharacterSet>NotSet</CharacterSet>
+   </PropertyGroup>
++  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='release-winssl|x64'" Label="Configuration">
++    <ConfigurationType>StaticLibrary</ConfigurationType>
++    <UseDebugLibraries>false</UseDebugLibraries>
++    <PlatformToolset>v120</PlatformToolset>
++    <WholeProgramOptimization>true</WholeProgramOptimization>
++    <CharacterSet>NotSet</CharacterSet>
++  </PropertyGroup>
+   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+   <ImportGroup Label="ExtensionSettings">
+   </ImportGroup>
+@@ -34,9 +55,15 @@
+   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='debug-winssl|Win32'">
+     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+   </ImportGroup>
++  <ImportGroup Condition="'$(Configuration)|$(Platform)'=='debug-winssl|x64'" Label="PropertySheets">
++    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
++  </ImportGroup>
+   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='release-winssl|Win32'">
+     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+   </ImportGroup>
++  <ImportGroup Condition="'$(Configuration)|$(Platform)'=='release-winssl|x64'" Label="PropertySheets">
++    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
++  </ImportGroup>
+   <PropertyGroup Label="UserMacros" />
+   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='debug-winssl|Win32'">
+     <OutDir>..\..\build\lib\$(Platform)\$(Configuration)\</OutDir>
+@@ -46,10 +73,19 @@
+     </CustomBuildAfterTargets>
+     <CustomBuildBeforeTargets>Clean</CustomBuildBeforeTargets>
+   </PropertyGroup>
++  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='debug-winssl|x64'">
++    <TargetName>$(ProjectName)d</TargetName>
++    <CustomBuildAfterTargets />
++    <CustomBuildBeforeTargets>Clean</CustomBuildBeforeTargets>
++    <OutDir>..\..\build\lib\$(Platform)\$(Configuration)\</OutDir>
++  </PropertyGroup>
+   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='release-winssl|Win32'">
+     <OutDir>..\..\build\lib\$(Platform)\$(Configuration)\</OutDir>
+     <IntDir>$(ProjectName)\$(Configuration)\</IntDir>
+   </PropertyGroup>
++  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='release-winssl|x64'">
++    <OutDir>..\..\build\lib\$(Platform)\$(Configuration)\</OutDir>
++  </PropertyGroup>
+   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='debug-winssl|Win32'">
+     <ClCompile>
+       <WarningLevel>Level3</WarningLevel>
+@@ -65,12 +101,41 @@
+       <GenerateDebugInformation>true</GenerateDebugInformation>
+     </Link>
+     <PostBuildEvent>
+-      <Command>xcopy /y /s ..\..\include\*.h ..\..\build\include\</Command>
++      <Command>xcopy /y /s ..\..\include\*.h ..\..\build\include\
++@rem rmdir /q /s ..\..\..\..\..\dev\3rdparty\curl\
++xcopy /D /y /s ..\..\build ..\..\..\..\..\dev\3rdparty\curl\
++
++</Command>
+     </PostBuildEvent>
+     <CustomBuildStep>
+       <Command>rmdir /s /q ..\..\build\</Command>
+     </CustomBuildStep>
+   </ItemDefinitionGroup>
++  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='debug-winssl|x64'">
++    <ClCompile>
++      <WarningLevel>Level3</WarningLevel>
++      <Optimization>Disabled</Optimization>
++      <SDLCheck>false</SDLCheck>
++      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
++      <PreprocessorDefinitions>_DEBUG;USE_SCHANNEL;CURL_DISABLE_LDAP;CURL_STATICLIB;WIN32;BUILDING_LIBCURL;_BIND_TO_CURRENT_VCLIBS_VERSION=1;USE_WINDOWS_SSPI;%(PreprocessorDefinitions)</PreprocessorDefinitions>
++      <AdditionalIncludeDirectories>..\..\lib;..\..\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++      <ProgramDataBaseFileName>$(OutDir)$(TargetName).pdb</ProgramDataBaseFileName>
++      <MultiProcessorCompilation>false</MultiProcessorCompilation>
++    </ClCompile>
++    <Link>
++      <GenerateDebugInformation>true</GenerateDebugInformation>
++    </Link>
++    <PostBuildEvent>
++      <Command>xcopy /y /s ..\..\include\*.h ..\..\build\include\
++@rem rmdir /q /s ..\..\..\..\..\dev\3rdparty\curl\
++xcopy /D /y /s ..\..\build ..\..\..\..\..\dev\3rdparty\curl\
++
++</Command>
++    </PostBuildEvent>
++    <CustomBuildStep>
++      <Command>rmdir /s /q ..\..\build\</Command>
++    </CustomBuildStep>
++  </ItemDefinitionGroup>
+   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='release-winssl|Win32'">
+     <ClCompile>
+       <WarningLevel>Level3</WarningLevel>
+@@ -88,7 +153,39 @@
+       <EnableCOMDATFolding>true</EnableCOMDATFolding>
+       <OptimizeReferences>true</OptimizeReferences>
+     </Link>
++    <PostBuildEvent>
++      <Command>xcopy /y /s ..\..\include\*.h ..\..\build\include\
++@rem rmdir /q /s ..\..\..\..\..\dev\3rdparty\curl\
++xcopy /D /y /s ..\..\build ..\..\..\..\..\dev\3rdparty\curl\
++
++</Command>
++    </PostBuildEvent>
+   </ItemDefinitionGroup>
++  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='release-winssl|x64'">
++    <ClCompile>
++      <WarningLevel>Level3</WarningLevel>
++      <Optimization>MaxSpeed</Optimization>
++      <FunctionLevelLinking>true</FunctionLevelLinking>
++      <IntrinsicFunctions>true</IntrinsicFunctions>
++      <SDLCheck>true</SDLCheck>
++      <MultiProcessorCompilation>true</MultiProcessorCompilation>
++      <PreprocessorDefinitions>NDEBUG;USE_SCHANNEL;CURL_DISABLE_LDAP;CURL_STATICLIB;WIN32;BUILDING_LIBCURL;_BIND_TO_CURRENT_VCLIBS_VERSION=1;USE_WINDOWS_SSPI;%(PreprocessorDefinitions)</PreprocessorDefinitions>
++      <AdditionalIncludeDirectories>..\..\lib;..\..\Include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++      <ProgramDataBaseFileName>$(OutDir)$(TargetName).pdb</ProgramDataBaseFileName>
++    </ClCompile>
++    <Link>
++      <GenerateDebugInformation>true</GenerateDebugInformation>
++      <EnableCOMDATFolding>true</EnableCOMDATFolding>
++      <OptimizeReferences>true</OptimizeReferences>
++    </Link>
++    <PostBuildEvent>
++      <Command>xcopy /y /s ..\..\include\*.h ..\..\build\include\
++@rem rmdir /q /s ..\..\..\..\..\dev\3rdparty\curl\
++xcopy /D /y /s ..\..\build ..\..\..\..\..\dev\3rdparty\curl\
++
++</Command>
++    </PostBuildEvent>
++  </ItemDefinitionGroup>
+   <ItemGroup>
+     <ClCompile Include="..\..\lib\amigaos.c" />
+     <ClCompile Include="..\..\lib\asyn-ares.c" />
+@@ -254,7 +351,6 @@
+     <ClInclude Include="..\..\lib\curl_ntlm_wb.h" />
+     <ClInclude Include="..\..\lib\curl_rtmp.h" />
+     <ClInclude Include="..\..\lib\curl_sasl.h" />
+-    <ClInclude Include="..\..\lib\curl_schannel.h" />
+     <ClInclude Include="..\..\lib\curl_sec.h" />
+     <ClInclude Include="..\..\lib\curl_setup.h" />
+     <ClInclude Include="..\..\lib\curl_setup_once.h" />
+Index: vs/vc12/libcurl.vcxproj.filters
+===================================================================
+--- vs/vc12/libcurl.vcxproj.filters	(revision 49985)
++++ vs/vc12/libcurl.vcxproj.filters	(revision 60690)
+@@ -512,9 +512,6 @@
+     <ClInclude Include="..\..\lib\curl_sasl.h">
+       <Filter>Header Files</Filter>
+     </ClInclude>
+-    <ClInclude Include="..\..\lib\curl_schannel.h">
+-      <Filter>Header Files</Filter>
+-    </ClInclude>
+     <ClInclude Include="..\..\lib\curl_sec.h">
+       <Filter>Header Files</Filter>
+     </ClInclude>
