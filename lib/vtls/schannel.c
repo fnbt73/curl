@@ -540,6 +540,7 @@ schannel_connect_step1(struct connectdata *conn, int sockindex)
 
   if(!BACKEND->cred) {
     /* setup Schannel API options */
+    pschannel_cred = &schannel_cred; /* TPS */
     memset(&schannel_cred, 0, sizeof(schannel_cred));
     schannel_cred.dwVersion = SCHANNEL_CRED_VERSION;
 
@@ -602,9 +603,16 @@ schannel_connect_step1(struct connectdata *conn, int sockindex)
       schannel_cred.grbitEnabledProtocols = SP_PROT_SSL2_CLIENT;
       break;
     default:
-      failf(conn, "Unrecognized parameter passed via CURLOPT_SSLVERSION");
-      return CURLE_SSL_CONNECT_ERROR;
+      //failf(conn, "Unrecognized parameter passed via CURLOPT_SSLVERSION");
+      //return CURLE_SSL_CONNECT_ERROR;
+        schannel_cred.grbitEnabledProtocols = SP_PROT_TLS1_0_CLIENT |
+            SP_PROT_TLS1_1_CLIENT |
+            SP_PROT_TLS1_2_CLIENT |
+            SP_PROT_SSL3_CLIENT;
+        infof(conn, "Defaulting to TLS1_0|TLS1_1|TLS1_2|SSL3");
+        break;
     }
+
 
     if(SSL_CONN_CONFIG(cipher_list)) {
       result = set_ssl_ciphers(&schannel_cred, SSL_CONN_CONFIG(cipher_list));
@@ -613,6 +621,7 @@ schannel_connect_step1(struct connectdata *conn, int sockindex)
         return result;
       }
     }
+
 
 
 #ifdef HAS_CLIENT_CERT_PATH
@@ -727,6 +736,12 @@ schannel_connect_step1(struct connectdata *conn, int sockindex)
           return CURLE_SSL_CONNECT_ERROR;
       }
     }
+  }
+  else /* TPS */
+  {
+    /* user-defined pschannel_cred */
+    pschannel_cred = (SCHANNEL_CRED*)(BACKEND->cred); //  (data->set.ssl.schannel_cred);
+    infof(conn, "schannel: using supplied credential\n");
   }
 
   /* Warn if SNI is disabled due to use of an IP address */
@@ -986,8 +1001,23 @@ schannel_connect_step2(struct connectdata *conn, int sockindex)
           BACKEND->encdata_offset, BACKEND->encdata_length);
 
     /* setup input buffers */
-    InitSecBuffer(&inbuf[0], SECBUFFER_TOKEN, malloc(BACKEND->encdata_offset),
-                  curlx_uztoul(BACKEND->encdata_offset));
+    //InitSecBuffer(&inbuf[0], SECBUFFER_TOKEN, malloc(BACKEND->encdata_offset),
+    //              curlx_uztoul(BACKEND->encdata_offset));
+    /* TPS-Begin */
+    /* cdp: explicitly check for connssl->encdata_offset == 0; 
+     * happens if peer initiates renegotiation 
+     s*/
+    if (!BACKEND->encdata_offset)
+    {
+        InitSecBuffer(&inbuf[0], SECBUFFER_TOKEN, malloc(BACKEND->encdata_length),
+            BACKEND->encdata_length);
+    }
+    else
+    {
+        InitSecBuffer(&inbuf[0], SECBUFFER_TOKEN, malloc(BACKEND->encdata_offset),
+            curlx_uztoul(BACKEND->encdata_offset));
+    }
+    /* TPS-End */
     InitSecBuffer(&inbuf[1], SECBUFFER_EMPTY, NULL, 0);
     InitSecBufferDesc(&inbuf_desc, inbuf, 2);
 
@@ -1270,6 +1300,7 @@ schannel_connect_step3(struct connectdata *conn, int sockindex)
 
   /* check if the required context attributes are met */
   if(BACKEND->ret_flags != BACKEND->req_flags) {
+    failf(conn, "schannel: context attribute flags mismatched. requested=%lu, returned=%lu", BACKEND->req_flags, BACKEND->ret_flags);
     if(!(BACKEND->ret_flags & ISC_RET_SEQUENCE_DETECT))
       failf(conn, "schannel: failed to setup sequence detection");
     if(!(BACKEND->ret_flags & ISC_RET_REPLAY_DETECT))
@@ -1514,6 +1545,7 @@ schannel_send(struct connectdata *conn, int sockindex,
       SECPKG_ATTR_STREAM_SIZES,
       &BACKEND->stream_sizes);
     if(sspi_status != SEC_E_OK) {
+      failf(conn, "schannel: QueryContextAttributes failed %s", Curl_sspi_strerror(conn, sspi_status));
       *err = CURLE_SEND_ERROR;
       return -1;
     }
@@ -1529,6 +1561,7 @@ schannel_send(struct connectdata *conn, int sockindex,
     BACKEND->stream_sizes.cbTrailer;
   data = (unsigned char *) malloc(data_len);
   if(data == NULL) {
+    failf(conn, "schannel: out of memory in schannel_send()");
     *err = CURLE_OUT_OF_MEMORY;
     return -1;
   }
@@ -1912,9 +1945,10 @@ cleanup:
      !BACKEND->recv_sspi_close_notify) {
     bool isWin2k = Curl_verify_windows_version(5, 0, PLATFORM_WINNT,
                                                VERSION_EQUAL);
-
-    if(isWin2k && sspi_status == SEC_E_OK)
-      BACKEND->recv_sspi_close_notify = true;
+    
+    //if(isWin2k && sspi_status == SEC_E_OK)
+    if (sspi_status == SEC_E_OK) /* TPS TKKZZZ */
+      BACKEND->recv_sspi_close_notify = true; //TKKZZZs
     else {
       *err = CURLE_RECV_ERROR;
       infof(conn, "schannel: server closed abruptly (missing close_notify)\n");
