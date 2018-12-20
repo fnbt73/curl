@@ -309,6 +309,20 @@ static CURLcode getinfo_offt(struct Curl_easy *data, CURLINFO info,
   return CURLE_OK;
 }
 
+static CURLcode getinfo_pointer(struct Curl_easy *data, CURLINFO info, void** param)
+{
+    switch (info) {
+
+    case CURLINFO_USER_DATA:
+        *param = data->set.ssl.user_data;
+        break;
+
+    default:
+        return CURLE_BAD_FUNCTION_ARGUMENT;
+    }
+    return CURLE_OK;
+}
+
 static CURLcode getinfo_double(struct Curl_easy *data, CURLINFO info,
                                double *param_doublep)
 {
@@ -439,6 +453,7 @@ CURLcode Curl_getinfo(struct Curl_easy *data, CURLINFO info, ...)
   curl_off_t *param_offt = NULL;
   const char **param_charp = NULL;
   struct curl_slist **param_slistp = NULL;
+  void** param_pointerp = NULL;
   curl_socket_t *param_socketp = NULL;
   int type;
   CURLcode result = CURLE_UNKNOWN_OPTION;
@@ -480,6 +495,11 @@ CURLcode Curl_getinfo(struct Curl_easy *data, CURLINFO info, ...)
     if(param_socketp)
       result = getinfo_socket(data, info, param_socketp);
     break;
+  case CURLINFO_POINTER:
+      param_pointerp = va_arg(arg, void**);
+      if (param_pointerp)
+          result = getinfo_pointer(data, info, param_pointerp);
+      break;
   default:
     break;
   }

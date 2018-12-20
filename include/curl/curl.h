@@ -679,6 +679,17 @@ typedef CURLcode (*curl_ssl_ctx_callback)(CURL *curl,    /* easy handle */
                                                             OpenSSL SSL_CTX */
                                           void *userptr);
 
+/* TPS-start */
+
+/*
+curl_schannel_validate_server_cert_callback
+  PCCERT_CONTEXT peerCert
+  peerName (server-name)
+*/
+typedef CURLcode(*curl_schannel_validate_server_cert_callback)(CURL* curl, void* peerCert, const char* peerName);
+
+/* TPS-end */
+
 typedef enum {
   CURLPROXY_HTTP = 0,   /* added in 7.10, new in 7.19.4 default is to use
                            CONNECT HTTP/1.1 */
@@ -1887,9 +1898,22 @@ typedef enum {
 
   /* add trailing data just after no more data is available */
   CINIT(TRAILERFUNCTION, FUNCTIONPOINT, 283),
-
+ 
   /* pointer to be passed to HTTP_TRAILER_FUNCTION */
   CINIT(TRAILERDATA, OBJECTPOINT, 284),
+
+  /* TPS-start */
+
+  /* schannel client certificate authentication; user can pass in PSCHANNEL_CRED. optional. */
+  CINIT(SCHANNEL_CRED, OBJECTPOINT, 285),
+
+  /* schannel server certificate validation callback (see curl_schannel_validate_server_cert_callback). optional. */
+  CINIT(SCHANNEL_VALIDATE_SERVER_CERT_CALLBACK, FUNCTIONPOINT, 286),
+
+  /* general user-info */
+  CINIT(USER_DATA, OBJECTPOINT, 287),
+
+  /* TPS-end */
 
   CURLOPT_LASTENTRY /* the last unused */
 } CURLoption;
@@ -2508,6 +2532,7 @@ struct curl_tlssessioninfo {
 #define CURLINFO_PTR      0x400000 /* same as SLIST */
 #define CURLINFO_SOCKET   0x500000
 #define CURLINFO_OFF_T    0x600000
+#define CURLINFO_POINTER  0x700000 /* TPS */
 #define CURLINFO_MASK     0x0fffff
 #define CURLINFO_TYPEMASK 0xf00000
 
@@ -2580,8 +2605,8 @@ typedef enum {
   CURLINFO_STARTTRANSFER_TIME_T = CURLINFO_OFF_T + 54,
   CURLINFO_REDIRECT_TIME_T  = CURLINFO_OFF_T + 55,
   CURLINFO_APPCONNECT_TIME_T = CURLINFO_OFF_T + 56,
-
-  CURLINFO_LASTONE          = 56
+  CURLINFO_USER_DATA = CURLINFO_POINTER + 57, /* TPS */
+  CURLINFO_LASTONE          = 57
 } CURLINFO;
 
 /* CURLINFO_RESPONSE_CODE is the new name for the option previously known as
@@ -2721,6 +2746,8 @@ typedef struct {
   unsigned int brotli_ver_num; /* Numeric Brotli version
                                   (MAJOR << 24) | (MINOR << 12) | PATCH */
   const char *brotli_version; /* human readable string. */
+
+  const char *tps_version; /* TPS */
 
 } curl_version_info_data;
 

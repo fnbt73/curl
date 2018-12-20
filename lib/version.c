@@ -20,6 +20,9 @@
  *
  ***************************************************************************/
 
+ /* TPS */
+#define TPS_LIBCURL_VERSION "1.1"
+
 #include "curl_setup.h"
 
 #include <curl/curl.h>
@@ -124,6 +127,12 @@ char *curl_version(void)
       ptr += len;
     }
   }
+
+  /* TPS-start */
+  len = snprintf(ptr, left, " tps/%s", TPS_LIBCURL_VERSION);
+  left -= len;
+  ptr += len;
+  /* TPS-end */
 
 #ifdef HAVE_LIBZ
   len = msnprintf(ptr, left, " zlib/%s", zlibVersion());
@@ -378,6 +387,7 @@ static curl_version_info_data version_info = {
   NULL, /* ssh lib version */
   0,    /* brotli_ver_num */
   NULL, /* brotli version */
+  TPS_LIBCURL_VERSION /* TPS */
 };
 
 curl_version_info_data *curl_version_info(CURLversion stamp)

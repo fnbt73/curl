@@ -2646,6 +2646,19 @@ CURLcode Curl_vsetopt(struct Curl_easy *data, CURLoption option,
     data->set.trailer_data = va_arg(param, void *);
 #endif
     break;
+
+/* TPS - start */
+  case CURLOPT_SCHANNEL_CRED:
+      data->set.ssl.schannel_cred = va_arg(param, void*);
+      break;
+  case CURLOPT_SCHANNEL_VALIDATE_SERVER_CERT_CALLBACK:
+      data->set.ssl.schannel_fn = va_arg(param, curl_schannel_validate_server_cert_callback);
+      break;
+  case CURLOPT_USER_DATA:
+      data->set.ssl.user_data = va_arg(param, void*);
+      break;
+/* TPS-end */
+
   default:
     /* unknown tag and its companion, just ignore: */
     result = CURLE_UNKNOWN_OPTION;

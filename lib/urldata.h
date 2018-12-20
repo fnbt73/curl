@@ -246,6 +246,12 @@ struct ssl_config_data {
   char *password; /* TLS password (for, e.g., SRP) */
   enum CURL_TLSAUTH authtype; /* TLS authentication type (default SRP) */
 #endif
+
+  /* TPS-start */
+  void* schannel_cred;
+  curl_schannel_validate_server_cert_callback schannel_fn;
+  void* user_data;
+  /* TPS-end */
 };
 
 struct ssl_general_config {
